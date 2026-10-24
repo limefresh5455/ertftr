@@ -3,9 +3,9 @@ import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "elexon_data.db")
-ROOT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "elexon_data.db")
-
+# DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "elexon_data.db")
+# ROOT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "elexon_data.db")
+ROOT_DB_PATH = os.environ.get("DB_PATH", "/tmp/app.db")
 
 def resolve_db_path(db_path: Optional[str] = None) -> str:
     if db_path:
