@@ -9,5 +9,5 @@ services:
     environment:
       - PORT=8000
       - HOST=0.0.0.0
-      - DATABASE_PATH=/app/elexon_data.db
+      - DATABASE_PATH=/backend/elexon_data.db
     restart: unless-stopped
