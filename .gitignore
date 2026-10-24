@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+node_modules/
+dist/
+dist-ssr/
+.DS_Store
+*.log
+/elexon_data.db
+
+# Explicitly track the primed SQLite database in backend
+!backend/elexon_data.db
