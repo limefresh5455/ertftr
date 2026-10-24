@@ -3,24 +3,30 @@ import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
-# DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "elexon_data.db")
-# ROOT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "elexon_data.db")
-ROOT_DB_PATH = os.environ.get("DB_PATH", "/tmp/app.db")
+import shutil
+
+# Read-only DB bundled with the deploy (optional, for pre-seeded data)
+BUNDLED_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "elexon_data.db")
+RUNTIME_DB_PATH = os.environ.get("DATABASE_PATH") or os.environ.get("DB_PATH") or "/tmp/app.db"
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+
 
 def resolve_db_path(db_path: Optional[str] = None) -> str:
     if db_path:
         return db_path
-    if "DATABASE_PATH" in os.environ:
-        return os.environ["DATABASE_PATH"]
-    # If backend db is empty or missing, and root db has primed data, sync it
-    if (not os.path.exists(DEFAULT_DB_PATH) or os.path.getsize(DEFAULT_DB_PATH) < 100_000) and os.path.exists(ROOT_DB_PATH) and os.path.getsize(ROOT_DB_PATH) > 100_000:
+    # Seed the writable DB from the bundled one on a cold start
+    if (
+        os.path.exists(BUNDLED_DB_PATH)
+        and BUNDLED_DB_PATH != RUNTIME_DB_PATH
+        and (not os.path.exists(RUNTIME_DB_PATH) or os.path.getsize(RUNTIME_DB_PATH) < 100_000)
+        and os.path.getsize(BUNDLED_DB_PATH) > 100_000
+    ):
         try:
-            import shutil
-            shutil.copy2(ROOT_DB_PATH, DEFAULT_DB_PATH)
-            return DEFAULT_DB_PATH
+            os.makedirs(os.path.dirname(RUNTIME_DB_PATH), exist_ok=True)
+            shutil.copy2(BUNDLED_DB_PATH, RUNTIME_DB_PATH)
         except Exception:
-            return ROOT_DB_PATH
-    return DEFAULT_DB_PATH
+            pass
+    return RUNTIME_DB_PATH
 
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -28,10 +34,10 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    if not ON_VERCEL:  # WAL needs -wal/-shm files; skip on serverless
+        conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
-
 
 def init_db(db_path: Optional[str] = None) -> None:
     conn = get_connection(db_path)
