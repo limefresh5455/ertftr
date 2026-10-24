@@ -1,43 +1,81 @@
 import sqlite3
 import os
+import shutil
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
-import shutil
-
-# Read-only DB bundled with the deploy (optional, for pre-seeded data)
-BUNDLED_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "elexon_data.db")
-RUNTIME_DB_PATH = os.environ.get("DATABASE_PATH") or os.environ.get("DB_PATH") or "/tmp/app.db"
 ON_VERCEL = bool(os.environ.get("VERCEL"))
+
+# Optional pre-seeded DB shipped with the deployment (read-only on Vercel).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BUNDLED_DB_CANDIDATES = [
+    os.path.join(_HERE, "elexon_data.db"),
+    os.path.join(os.path.dirname(_HERE), "elexon_data.db"),
+]
+
+# Writable runtime DB. On Vercel only /tmp is writable.
+if ON_VERCEL:
+    RUNTIME_DB_PATH = "/tmp/app.db"
+else:
+    RUNTIME_DB_PATH = (
+        os.environ.get("DATABASE_PATH")
+        or os.environ.get("DB_PATH")
+        or os.path.join(_HERE, "elexon_data.db")
+    )
+
+MIN_VALID_DB_SIZE = 100_000  # bytes; smaller files are treated as empty
+
+
+def _find_bundled_db() -> Optional[str]:
+    for p in BUNDLED_DB_CANDIDATES:
+        try:
+            if (
+                os.path.exists(p)
+                and os.path.getsize(p) > MIN_VALID_DB_SIZE
+                and os.path.abspath(p) != os.path.abspath(RUNTIME_DB_PATH)
+            ):
+                return p
+        except OSError:
+            continue
+    return None
 
 
 def resolve_db_path(db_path: Optional[str] = None) -> str:
     if db_path:
         return db_path
-    # Seed the writable DB from the bundled one on a cold start
-    if (
-        os.path.exists(BUNDLED_DB_PATH)
-        and BUNDLED_DB_PATH != RUNTIME_DB_PATH
-        and (not os.path.exists(RUNTIME_DB_PATH) or os.path.getsize(RUNTIME_DB_PATH) < 100_000)
-        and os.path.getsize(BUNDLED_DB_PATH) > 100_000
-    ):
-        try:
-            os.makedirs(os.path.dirname(RUNTIME_DB_PATH), exist_ok=True)
-            shutil.copy2(BUNDLED_DB_PATH, RUNTIME_DB_PATH)
-        except Exception:
-            pass
+
+    # Seed the writable DB from the bundled one if it's missing/empty.
+    try:
+        needs_seed = (
+            not os.path.exists(RUNTIME_DB_PATH)
+            or os.path.getsize(RUNTIME_DB_PATH) < MIN_VALID_DB_SIZE
+        )
+    except OSError:
+        needs_seed = True
+
+    if needs_seed:
+        bundled = _find_bundled_db()
+        if bundled:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(RUNTIME_DB_PATH)), exist_ok=True)
+                shutil.copy2(bundled, RUNTIME_DB_PATH)
+            except Exception:
+                # Fall back to reading the bundled DB directly (read-only is fine for queries)
+                return bundled
     return RUNTIME_DB_PATH
 
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     path = resolve_db_path(db_path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
-    if not ON_VERCEL:  # WAL needs -wal/-shm files; skip on serverless
+    if not ON_VERCEL:
+        # WAL needs -wal/-shm sidecar files; skip on serverless
         conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
 
 def init_db(db_path: Optional[str] = None) -> None:
     conn = get_connection(db_path)
@@ -136,8 +174,8 @@ def update_sync_status(dataset_name: str, count: int, status: str = "SUCCESS", d
 
 
 def get_actuals_series(
-    date_from: str, 
-    date_to: str, 
+    date_from: str,
+    date_to: str,
     db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
@@ -166,22 +204,19 @@ def get_day_ahead_forecasts_series(
     """
     conn = get_connection(db_path)
     try:
-        # Determine all delivery dates in range
         start_dt = datetime.strptime(date_from, "%Y-%m-%d").date()
         end_dt = datetime.strptime(date_to, "%Y-%m-%d").date()
-        
+
         results = []
         cur_dt = start_dt
         while cur_dt <= end_dt:
             cur_date_str = cur_dt.strftime("%Y-%m-%d")
-            # D-1 cutoff timestamp
             d_minus_1 = cur_dt - timedelta(days=1)
             cutoff_ts = f"{d_minus_1.strftime('%Y-%m-%d')}T{cutoff_time}Z"
-            
-            # Target day start and end timestamps
+
             day_start_ts = f"{cur_date_str}T00:00:00Z"
             day_end_ts = f"{cur_date_str}T23:30:00Z"
-            
+
             cursor = conn.execute("""
                 SELECT f.start_time, f.generation_mw, f.publish_time
                 FROM forecast_generation f
@@ -194,12 +229,12 @@ def get_day_ahead_forecasts_series(
                 ) latest ON f.start_time = latest.start_time AND f.publish_time = latest.max_pub
                 ORDER BY f.start_time ASC
             """, (day_start_ts, day_end_ts, cutoff_ts))
-            
+
             for row in cursor.fetchall():
                 results.append(dict(row))
-            
+
             cur_dt += timedelta(days=1)
-            
+
         return results
     finally:
         conn.close()
@@ -210,20 +245,20 @@ def get_metadata_info(db_path: Optional[str] = None) -> Dict[str, Any]:
     try:
         actuals_cnt = conn.execute("SELECT COUNT(*) FROM actual_generation").fetchone()[0]
         forecasts_cnt = conn.execute("SELECT COUNT(*) FROM forecast_generation").fetchone()[0]
-        
+
         act_dates = conn.execute("""
             SELECT MIN(settlement_date), MAX(settlement_date) 
             FROM actual_generation
         """).fetchone()
-        
+
         for_times = conn.execute("""
             SELECT MIN(start_time), MAX(start_time), MIN(publish_time), MAX(publish_time)
             FROM forecast_generation
         """).fetchone()
-        
+
         sync_rows = conn.execute("SELECT dataset_name, last_synced, record_count, status FROM ingestion_status").fetchall()
         sync_info = {row["dataset_name"]: dict(row) for row in sync_rows}
-        
+
         return {
             "actuals_count": actuals_cnt,
             "forecasts_count": forecasts_cnt,
